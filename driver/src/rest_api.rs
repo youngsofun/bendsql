@@ -31,7 +31,9 @@ use databend_client::APIClient;
 use databend_client::PresignedResponse;
 use databend_client::QueryResponse;
 use databend_driver_core::error::{Error, Result};
-use databend_driver_core::rows::{Row, RowIterator, RowStatsIterator, RowWithStats, ServerStats};
+use databend_driver_core::rows::{
+    Row, RowBatch, RowBatchIterator, RowIterator, RowStatsIterator, RowWithStats, ServerStats,
+};
 use databend_driver_core::schema::{Schema, SchemaRef};
 
 use crate::conn::{Connection, ConnectionInfo, Reader};
@@ -83,8 +85,16 @@ impl Connection for RestAPIConnection {
         info!("query iter ext: {}", sql);
         let resp = self.client.start_query(sql).await?;
         let resp = self.wait_for_schema(resp).await?;
-        let (schema, rows) = RestAPIRows::from_response(self.client.clone(), resp)?;
+        let (schema, rows) = RestAPIRows::<false>::from_response(self.client.clone(), resp)?;
         Ok(RowStatsIterator::new(Arc::new(schema), Box::pin(rows)))
+    }
+
+    async fn query_iter_batch(&self, sql: &str) -> Result<RowBatchIterator> {
+        info!("query iter ext: {}", sql);
+        let resp = self.client.start_query(sql).await?;
+        let resp = self.wait_for_schema(resp).await?;
+        let (schema, rows) = RestAPIRows::<true>::from_response(self.client.clone(), resp)?;
+        Ok(RowBatchIterator::new(Arc::new(schema), Box::pin(rows)))
     }
 
     async fn get_presigned_url(&self, operation: &str, stage: &str) -> Result<PresignedResponse> {
@@ -253,7 +263,7 @@ impl<'o> RestAPIConnection {
 
 type PageFut = Pin<Box<dyn Future<Output = Result<QueryResponse>> + Send>>;
 
-pub struct RestAPIRows {
+pub struct RestAPIRows<const BATCH: bool> {
     client: Arc<APIClient>,
     schema: SchemaRef,
     data: VecDeque<Vec<Option<String>>>,
@@ -264,7 +274,7 @@ pub struct RestAPIRows {
     next_page: Option<PageFut>,
 }
 
-impl RestAPIRows {
+impl<const BATCH: bool> RestAPIRows<BATCH> {
     fn from_response(client: Arc<APIClient>, resp: QueryResponse) -> Result<(Schema, Self)> {
         let schema: Schema = resp.schema.try_into()?;
         let rows = Self {
@@ -279,9 +289,32 @@ impl RestAPIRows {
         };
         Ok((schema, rows))
     }
+
+    fn on_new_page(mut self: Pin<&mut Self>, resp: QueryResponse) -> Result<()> {
+        self.data = resp.data.into();
+        if self.schema.fields().is_empty() {
+            self.schema = Arc::new(resp.schema.try_into()?);
+        }
+        self.next_uri = resp.next_uri;
+        self.next_page = None;
+        self.stats = Some(ServerStats::from(resp.stats));
+        Ok(())
+    }
+
+    fn fetch_next_page(mut self: Pin<&mut Self>, next_uri: String) {
+        let client = self.client.clone();
+        let query_id = self.query_id.clone();
+        let node_id = self.node_id.clone();
+        self.next_page = Some(Box::pin(async move {
+            client
+                .query_page(&query_id, &next_uri, &node_id)
+                .await
+                .map_err(|e| e.into())
+        }));
+    }
 }
 
-impl Stream for RestAPIRows {
+impl Stream for RestAPIRows<false> {
     type Item = Result<RowWithStats>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -295,13 +328,7 @@ impl Stream for RestAPIRows {
         match self.next_page {
             Some(ref mut next_page) => match Pin::new(next_page).poll(cx) {
                 Poll::Ready(Ok(resp)) => {
-                    self.data = resp.data.into();
-                    if self.schema.fields().is_empty() {
-                        self.schema = Arc::new(resp.schema.try_into()?);
-                    }
-                    self.next_uri = resp.next_uri;
-                    self.next_page = None;
-                    self.stats = Some(ServerStats::from(resp.stats));
+                    self.as_mut().on_new_page(resp)?;
                     self.poll_next(cx)
                 }
                 Poll::Ready(Err(e)) => {
@@ -310,18 +337,40 @@ impl Stream for RestAPIRows {
                 }
                 Poll::Pending => Poll::Pending,
             },
-            None => match self.next_uri {
-                Some(ref next_uri) => {
-                    let client = self.client.clone();
-                    let next_uri = next_uri.clone();
-                    let query_id = self.query_id.clone();
-                    let node_id = self.node_id.clone();
-                    self.next_page = Some(Box::pin(async move {
-                        client
-                            .query_page(&query_id, &next_uri, &node_id)
-                            .await
-                            .map_err(|e| e.into())
-                    }));
+            None => match self.next_uri.clone() {
+                Some(next_uri) => {
+                    self.as_mut().fetch_next_page(next_uri);
+                    self.poll_next(cx)
+                }
+                None => Poll::Ready(None),
+            },
+        }
+    }
+}
+
+impl Stream for RestAPIRows<true> {
+    type Item = Result<RowBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let data = std::mem::take(&mut self.data);
+        if !data.is_empty() {
+            return Poll::Ready(Some(Ok(RowBatch::try_from((self.schema.clone(), data))?)));
+        }
+        match self.next_page {
+            Some(ref mut next_page) => match Pin::new(next_page).poll(cx) {
+                Poll::Ready(Ok(resp)) => {
+                    self.as_mut().on_new_page(resp)?;
+                    self.poll_next(cx)
+                }
+                Poll::Ready(Err(e)) => {
+                    self.next_page = None;
+                    Poll::Ready(Some(Err(e)))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            None => match self.next_uri.clone() {
+                Some(next_uri) => {
+                    self.as_mut().fetch_next_page(next_uri);
                     self.poll_next(cx)
                 }
                 None => Poll::Ready(None),

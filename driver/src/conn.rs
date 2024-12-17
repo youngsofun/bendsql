@@ -28,7 +28,9 @@ use crate::flight_sql::FlightSQLConnection;
 use databend_client::StageLocation;
 use databend_client::{presign_download_from_stage, PresignedResponse};
 use databend_driver_core::error::{Error, Result};
-use databend_driver_core::rows::{Row, RowIterator, RowStatsIterator, RowWithStats, ServerStats};
+use databend_driver_core::rows::{
+    Row, RowBatchIterator, RowIterator, RowStatsIterator, RowWithStats, ServerStats,
+};
 use databend_driver_core::schema::{DataType, Field, NumberDataType, Schema};
 use databend_driver_core::value::{NumberValue, Value};
 
@@ -109,6 +111,9 @@ pub trait Connection: Send + Sync {
     async fn exec(&self, sql: &str) -> Result<i64>;
     async fn query_iter(&self, sql: &str) -> Result<RowIterator>;
     async fn query_iter_ext(&self, sql: &str) -> Result<RowStatsIterator>;
+    async fn query_iter_batch(&self, _sql: &str) -> Result<RowBatchIterator> {
+        unimplemented!()
+    }
 
     async fn query_row(&self, sql: &str) -> Result<Option<Row>> {
         let rows = self.query_all(sql).await?;

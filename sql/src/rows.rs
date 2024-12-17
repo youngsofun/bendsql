@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -80,6 +81,30 @@ impl From<databend_client::QueryStats> for ServerStats {
             p.total_bytes = total.bytes;
         }
         p
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RowBatch {
+    pub schema: SchemaRef,
+    pub columns: Vec<Vec<Value>>,
+}
+
+impl TryFrom<(SchemaRef, VecDeque<Vec<Option<String>>>)> for RowBatch {
+    type Error = Error;
+
+    fn try_from((schema, data): (SchemaRef, VecDeque<Vec<Option<String>>>)) -> Result<Self> {
+        let field_count = schema.fields().len();
+        let mut columns: Vec<Vec<Value>> = vec![Vec::with_capacity(data.len()); field_count];
+        
+        for row in data {
+            for (i, field) in schema.fields().iter().enumerate() {
+                let val: Option<&str> = row.get(i).and_then(|v| v.as_deref());
+                columns[i].push(Value::try_from((&field.data_type, val))?);
+            }
+        }
+        
+        Ok(Self { schema, columns })
     }
 }
 
@@ -320,6 +345,33 @@ impl RowStatsIterator {
 
 impl Stream for RowStatsIterator {
     type Item = Result<RowWithStats>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.it).poll_next(cx)
+    }
+}
+
+pub struct RowBatchIterator {
+    #[allow(unused)]
+    schema: SchemaRef,
+    #[allow(unused)]
+    it: Pin<Box<dyn Stream<Item = Result<RowBatch>> + Send>>,
+}
+
+impl RowBatchIterator {
+    pub fn new(
+        schema: SchemaRef,
+        it: Pin<Box<dyn Stream<Item = Result<RowBatch>> + Send>>,
+    ) -> Self {
+        Self { schema, it }
+    }
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for RowBatchIterator {
+    type Item = Result<RowBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.it).poll_next(cx)
