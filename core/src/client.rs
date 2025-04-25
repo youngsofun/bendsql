@@ -64,39 +64,43 @@ static VERSION: Lazy<String> = Lazy::new(|| {
 
 pub struct APIClient {
     cli: HttpClient,
+
+    // endpoint configs
+    endpoint: Url,
     scheme: String,
     host: String,
     port: u16,
 
-    endpoint: Url,
-
-    auth: Arc<dyn Auth>,
-
-    tenant: Option<String>,
-    warehouse: Mutex<Option<String>>,
-    session_state: Mutex<SessionState>,
-    route_hint: RouteHintGenerator,
-
-    disable_login: bool,
-    disable_session_token: bool,
-    session_token_info: Option<Arc<parking_lot::Mutex<(SessionTokenInfo, Instant)>>>,
-
-    closed: AtomicBool,
-
-    server_version: Option<String>,
-
+    // http handler only configs
     wait_time_secs: Option<i64>,
     max_rows_in_buffer: Option<i64>,
     max_rows_per_page: Option<i64>,
 
+    // io config
     connect_timeout: Duration,
     page_request_timeout: Duration,
 
-    tls_ca_file: Option<String>,
-
+    // presign config
     presign: Mutex<PresignMode>,
+
+    // user and auth configs
+    tenant: Option<String>,
+    disable_login: bool,
+    disable_session_token: bool,
+    tls_ca_file: Option<String>,
+    auth: Arc<dyn Auth>,
+
+    // mutable states
+    warehouse: Mutex<Option<String>>,
+    session_state: Mutex<SessionState>,
+    session_token_info: Option<Arc<Mutex<(SessionTokenInfo, Instant)>>>,
+    // todo: server may restart and version may change during a session
+    server_version: Option<String>,
     last_node_id: Mutex<Option<String>>,
     last_query_id: Mutex<Option<String>>,
+    closed: AtomicBool,
+
+    route_hint: RouteHintGenerator,
 }
 
 impl APIClient {
@@ -259,10 +263,7 @@ impl APIClient {
     }
 
     async fn build_client(&mut self, name: Option<String>) -> Result<()> {
-        let ua = match name {
-            Some(n) => n,
-            None => format!("databend-client-rust/{}", VERSION.as_str()),
-        };
+        let ua = name.unwrap_or_else(|| format!("databend-client-rust/{}", VERSION.as_str()));
         let cookie_provider = GlobalCookieStore::new();
         let cookie = HeaderValue::from_str("cookie_enabled=true").unwrap();
         let mut initial_cookies = [&cookie].into_iter();
