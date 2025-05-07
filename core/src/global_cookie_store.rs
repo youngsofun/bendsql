@@ -25,9 +25,13 @@ pub(crate) struct GlobalCookieStore {
 
 impl GlobalCookieStore {
     pub fn new() -> Self {
-        GlobalCookieStore {
+        let cookie_provider = GlobalCookieStore {
             cookies: RwLock::new(HashMap::new()),
-        }
+        };
+        let cookie = HeaderValue::from_str("cookie_enabled=true").unwrap();
+        let mut initial_cookies = [&cookie].into_iter();
+        cookie_provider.set_cookies(&mut initial_cookies, &Url::parse("https://a.com").unwrap());
+        cookie_provider
     }
 }
 

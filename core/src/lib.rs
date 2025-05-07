@@ -17,9 +17,11 @@ mod client;
 mod auth;
 mod error;
 mod error_code;
+#[cfg(not(target_arch = "wasm32"))]
 mod global_cookie_store;
 mod login;
 mod pages;
+#[cfg(not(target_arch = "wasm32"))]
 mod presign;
 mod request;
 mod response;
@@ -32,8 +34,12 @@ pub use client::APIClient;
 pub use error::Error;
 pub use pages::Page;
 pub use pages::Pages;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use presign::presign_download_from_stage;
+#[cfg(not(target_arch = "wasm32"))]
 pub use presign::presign_upload_to_stage;
+#[cfg(not(target_arch = "wasm32"))]
 pub use presign::PresignedResponse;
 pub use response::QueryStats;
 pub use response::SchemaField;

@@ -15,6 +15,7 @@
 use crate::error::Result;
 use crate::response::QueryResponse;
 use crate::{APIClient, QueryStats, SchemaField};
+use serde::Serialize;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_stream::{Stream, StreamExt};
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 pub struct Page {
     pub schema: Vec<SchemaField>,
     pub data: Vec<Vec<Option<String>>>,
@@ -48,8 +49,10 @@ impl Page {
         self.stats = p.stats;
     }
 }
-
+#[cfg(not(target_arch = "wasm32"))]
 type PageFut = Pin<Box<dyn Future<Output = Result<QueryResponse>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type PageFut = Pin<Box<dyn Future<Output = Result<QueryResponse>>>>;
 
 pub struct Pages {
     query_id: String,
@@ -78,6 +81,14 @@ impl Pages {
         s
     }
 
+    pub fn node_id(&self) -> Option<String> {
+        self.node_id.clone()
+    }
+
+    pub fn query_id(&self) -> String {
+        self.query_id.clone()
+    }
+
     pub fn add_back(&mut self, page: Page) {
         self.first_page = Some(page);
     }
@@ -98,6 +109,56 @@ impl Pages {
             }
         }
         Ok((self, vec![]))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Pages {
+    pub fn on_response(&mut self, body: Vec<u8>) -> Result<Page, String> {
+        let resp: QueryResponse = crate::client::json_from_slice(&body).unwrap();
+        self.client.handle_session(&resp.session);
+        match resp.error {
+            Some(err) => Err(err.to_string()),
+            None => {
+                self.next_uri = resp.next_uri.clone();
+                Ok(Page::from_response(resp))
+            }
+        }
+    }
+
+    pub fn first_page(&mut self) -> Option<Page> {
+        std::mem::take(&mut self.first_page)
+    }
+
+    pub fn headers(&mut self) -> std::collections::HashMap<String, String> {
+        let header_map = self.client.make_headers(Some(&self.query_id)).unwrap();
+        let mut string_map = std::collections::HashMap::new();
+        for (key, value) in header_map.iter() {
+            if let Ok(value_str) = value.to_str() {
+                string_map.insert(key.as_str().to_owned(), value_str.to_string());
+            }
+        }
+        string_map.insert(
+            "authorization".to_string(),
+            self.client.get_auth_header_value(),
+        );
+        string_map
+    }
+
+    pub fn next_uri(&mut self) -> Option<(String, std::collections::HashMap<String, String>)> {
+        let headers = self.headers();
+        self.next_uri.as_ref().map(|next_uri| {
+            (
+                format!(
+                    "{}://{}:{}{}",
+                    self.client.scheme(),
+                    self.client.host(),
+                    self.client.port(),
+                    next_uri
+                ),
+                headers,
+            )
+        })
     }
 }
 

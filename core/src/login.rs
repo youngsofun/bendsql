@@ -38,6 +38,7 @@ impl From<&SessionState> for LoginRequest {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn default_session_token_ttl_in_secs() -> u64 {
     3600
 }
@@ -45,6 +46,7 @@ fn default_session_token_ttl_in_secs() -> u64 {
 #[derive(Deserialize, Debug, Clone)]
 pub struct SessionTokenInfo {
     pub session_token: String,
+    #[cfg(not(target_arch = "wasm32"))]
     #[serde(default = "default_session_token_ttl_in_secs")]
     pub session_token_ttl_in_secs: u64,
     pub refresh_token: String,

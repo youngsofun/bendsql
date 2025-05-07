@@ -22,6 +22,10 @@ pub trait Auth: Sync + Send {
         false
     }
     fn username(&self) -> String;
+    #[cfg(target_arch = "wasm32")]
+    fn get_auth_header_value(&self) -> String {
+        unimplemented!()
+    }
 }
 
 #[derive(Clone)]
@@ -46,6 +50,19 @@ impl Auth for BasicAuth {
 
     fn username(&self) -> String {
         self.username.clone()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn get_auth_header_value(&self) -> String {
+        use std::io::Write;
+        let mut buf = b"Basic ".to_vec();
+        {
+            let mut encoder =
+                base64::write::EncoderWriter::new(&mut buf, &base64::prelude::BASE64_STANDARD);
+            let _ = write!(encoder, "{}:", self.username);
+            let _ = write!(encoder, "{}", self.password.inner());
+        }
+        String::from_utf8(buf).unwrap()
     }
 }
 
