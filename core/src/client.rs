@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ use crate::login::{
     SessionTokenInfo,
 };
 use crate::presign::{presign_upload_to_stage, PresignMode, PresignedResponse, Reader};
+use crate::response::{LoadResponse, Progresses};
 use crate::stage::StageLocation;
 use crate::{
     error::{Error, Result},
@@ -41,8 +43,11 @@ use percent_encoding::percent_decode_str;
 use reqwest::cookie::CookieStore;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
-use reqwest::{Body, Client as HttpClient, Request, RequestBuilder, Response, StatusCode};
+use reqwest::{Body, Client as HttpClient, Client, Request, RequestBuilder, Response, StatusCode};
+use semver::Version;
 use serde::Deserialize;
+use tokio::fs::File;
+use tokio::io::BufReader;
 use tokio::time::sleep;
 use tokio_retry::strategy::jitter;
 use tokio_stream::StreamExt;
@@ -55,6 +60,7 @@ const HEADER_STICKY_NODE: &str = "X-DATABEND-STICKY-NODE";
 const HEADER_WAREHOUSE: &str = "X-DATABEND-WAREHOUSE";
 const HEADER_STAGE_NAME: &str = "X-DATABEND-STAGE-NAME";
 const HEADER_ROUTE_HINT: &str = "X-DATABEND-ROUTE-HINT";
+const HEADER_SQL: &str = "SQL";
 const TXN_STATE_ACTIVE: &str = "Active";
 
 static VERSION: Lazy<String> = Lazy::new(|| {
@@ -83,7 +89,7 @@ pub struct APIClient {
 
     closed: AtomicBool,
 
-    server_version: Option<String>,
+    server_version: Option<Version>,
 
     wait_time_secs: Option<i64>,
     max_rows_in_buffer: Option<i64>,
@@ -95,8 +101,14 @@ pub struct APIClient {
     tls_ca_file: Option<String>,
 
     presign: Mutex<PresignMode>,
+    load_mode: LoadMode,
     last_node_id: Mutex<Option<String>>,
     last_query_id: Mutex<Option<String>>,
+}
+
+enum LoadMode {
+    Stage,
+    Stream,
 }
 
 impl APIClient {
@@ -168,6 +180,19 @@ impl APIClient {
                         }
                     };
                     client.set_presign_mode(presign_mode);
+                }
+                "load" => {
+                    let load_mode = match v.as_ref() {
+                        "stage" => LoadMode::Stage,
+                        "stream" => LoadMode::Stream,
+                        _ => {
+                            return Err(Error::BadArgument(format!(
+                                "Invalid value for presign: {}, should be one of stage/stream",
+                                v
+                            )))
+                        }
+                    };
+                    client.load_mode = load_mode;
                 }
                 "tenant" => {
                     client.tenant = Some(v.to_string());
@@ -605,7 +630,7 @@ impl APIClient {
     }
 
     pub async fn upload_to_stage(
-        self: &Arc<Self>,
+        self: &self,
         stage: &str,
         data: Reader,
         size: u64,
@@ -656,6 +681,123 @@ impl APIClient {
         Ok(())
     }
 
+    async fn streaming_load(
+        &self,
+        sql: &str,
+        data: Reader,
+        file_name: &str,
+    ) -> Result<LoadResponse> {
+        let body = Body::wrap_stream(ReaderStream::new(data));
+        let part = Part::stream(body).file_name(file_name.to_string());
+        let endpoint = self.endpoint.join("v1/streaming_load")?;
+        let mut builder = self.cli.put(endpoint.clone());
+        builder = self.wrap_auth_or_session_token(builder)?;
+        let query_id = self.gen_query_id();
+        let mut headers = self.make_headers(Some(&query_id))?;
+        headers.insert(HEADER_SQL, sql.parse()?);
+        let form = Form::new().part("upload", part);
+        let mut builder = self.cli.put(endpoint.clone());
+        builder = self.wrap_auth_or_session_token(builder)?;
+        let resp = builder.headers(headers).multipart(form).send().await?;
+        let status = resp.status();
+        if status != 200 {
+            return Err(
+                Error::response_error(status, &resp.bytes().await?).with_context("streaming_load")
+            );
+        }
+        let resp = resp.json::<LoadResponse>().await?;
+        Ok(resp)
+    }
+
+    fn default_file_format_options() -> BTreeMap<&'static str, &'static str> {
+        vec![
+            ("type", "CSV"),
+            ("field_delimiter", ","),
+            ("record_delimiter", "\n"),
+            ("skip_header", "0"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn default_copy_options() -> BTreeMap<&'static str, &'static str> {
+        vec![("purge", "true")].into_iter().collect()
+    }
+
+    pub async fn load_data(
+        &self,
+        sql: &str,
+        data: Reader,
+        size: u64,
+        file_name: Option<&str>,
+        file_format_options: Option<BTreeMap<&str, &str>>,
+        copy_options: Option<BTreeMap<&str, &str>>,
+    ) -> Result<QueryStats> {
+        info!(
+            "load data: {}, size: {}, format: {:?}, copy: {:?}",
+            sql, size, file_format_options, copy_options
+        );
+
+        if matches!(self.get_presign_mode(), PresignMode::Off) {
+            if let Some(ver) = &self.server_version {
+                if ver >= &Version::new(1, 2, 753) {
+                    let start = Instant::now();
+                    let resp = self
+                        .streaming_load(sql, data, file_name.unwrap_or("unknown"))
+                        .await?;
+                    let stats = QueryStats {
+                        progresses: Progresses {
+                            write_progress: resp.stats,
+                            ..Default::default()
+                        },
+                        running_time_ms: start.elapsed().as_secs_f64(),
+                    };
+                    return Ok(stats);
+                }
+            }
+        }
+
+        let file_format_options =
+            file_format_options.unwrap_or_else(Self::default_file_format_options);
+        let copy_options = copy_options.unwrap_or_else(Self::default_copy_options);
+
+        let now = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| Error::IO("Failed to get current timestamp".to_string()))?;
+        let stage = format!("@~/client/load/{}", now);
+        self.upload_to_stage(&stage, data, size).await?;
+        let stats = self
+            .insert_with_stage(sql, &stage, file_format_options, copy_options)
+            .await?;
+        Ok(stats)
+    }
+
+    pub async fn load_file(
+        &self,
+        sql: &str,
+        fp: &Path,
+        format_options: Option<BTreeMap<&str, &str>>,
+        copy_options: Option<BTreeMap<&str, &str>>,
+    ) -> Result<QueryStats> {
+        info!(
+            "load file: {}, file: {:?}, format: {:?}, copy: {:?}",
+            sql, fp, format_options, copy_options
+        );
+        let file = File::open(fp).await?;
+        let metadata = file.metadata().await?;
+        let size = metadata.len();
+        let data = BufReader::new(file);
+        self.load_data(
+            sql,
+            Box::new(data),
+            size,
+            fp.file_name().map(|p| p.to_str()).flatten(),
+            format_options,
+            copy_options,
+        )
+        .await
+    }
+
     async fn login(&mut self) -> Result<()> {
         let endpoint = self.endpoint.join("/v1/session/login")?;
         let headers = self.make_headers(None)?;
@@ -683,7 +825,11 @@ impl APIClient {
         match response {
             LoginResponseResult::Err { error } => return Err(Error::AuthFailure(error)),
             LoginResponseResult::Ok(info) => {
-                self.server_version = Some(info.version.clone());
+                self.server_version = Some(
+                    info.version
+                        .parse()
+                        .map_err(|e| Error::Decode(format!("invalid version: {e}")))?,
+                );
                 if let Some(tokens) = info.tokens {
                     info!("login success with session token");
                     self.session_token_info = Some(Arc::new(Mutex::new((tokens, Instant::now()))))

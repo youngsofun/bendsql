@@ -107,23 +107,9 @@ impl IConnection for RestAPIConnection {
         file_format_options: Option<BTreeMap<&str, &str>>,
         copy_options: Option<BTreeMap<&str, &str>>,
     ) -> Result<ServerStats> {
-        info!(
-            "load data: {}, size: {}, format: {:?}, copy: {:?}",
-            sql, size, file_format_options, copy_options
-        );
-        let now = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| Error::IO("Failed to get current timestamp".to_string()))?;
-        let stage = format!("@~/client/load/{now}");
-
-        let file_format_options =
-            file_format_options.unwrap_or_else(Self::default_file_format_options);
-        let copy_options = copy_options.unwrap_or_else(Self::default_copy_options);
-
-        self.upload_to_stage(&stage, data, size).await?;
         let stats = self
             .client
-            .insert_with_stage(sql, &stage, file_format_options, copy_options)
+            .load_data(sql, data, size, None, file_format_options, copy_options)
             .await?;
         Ok(ServerStats::from(stats))
     }
@@ -135,31 +121,11 @@ impl IConnection for RestAPIConnection {
         format_options: Option<BTreeMap<&str, &str>>,
         copy_options: Option<BTreeMap<&str, &str>>,
     ) -> Result<ServerStats> {
-        info!(
-            "load file: {}, file: {:?}, format: {:?}, copy: {:?}",
-            sql, fp, format_options, copy_options
-        );
-        let file = File::open(fp).await?;
-        let metadata = file.metadata().await?;
-        let size = metadata.len();
-        let data = BufReader::new(file);
-        let mut format_options = format_options.unwrap_or_else(Self::default_file_format_options);
-        if !format_options.contains_key("type") {
-            let file_type = fp
-                .extension()
-                .ok_or_else(|| Error::BadArgument("file type not specified".to_string()))?
-                .to_str()
-                .ok_or_else(|| Error::BadArgument("file type empty".to_string()))?;
-            format_options.insert("type", file_type);
-        }
-        self.load_data(
-            sql,
-            Box::new(data),
-            size,
-            Some(format_options),
-            copy_options,
-        )
-        .await
+        let stats = self
+            .client
+            .load_file(sql, fp, format_options, copy_options)
+            .await?;
+        Ok(ServerStats::from(stats))
     }
 
     async fn stream_load(&self, sql: &str, data: Vec<Vec<&str>>) -> Result<ServerStats> {
@@ -174,28 +140,6 @@ impl IConnection for RestAPIConnection {
         let reader = Box::new(std::io::Cursor::new(bytes));
         let stats = self.load_data(sql, reader, size, None, None).await?;
         Ok(stats)
-    }
-}
-
-impl<'o> RestAPIConnection {
-    pub async fn try_create(dsn: &str, name: String) -> Result<Self> {
-        let client = APIClient::new(dsn, Some(name)).await?;
-        Ok(Self { client })
-    }
-
-    fn default_file_format_options() -> BTreeMap<&'o str, &'o str> {
-        vec![
-            ("type", "CSV"),
-            ("field_delimiter", ","),
-            ("record_delimiter", "\n"),
-            ("skip_header", "0"),
-        ]
-        .into_iter()
-        .collect()
-    }
-
-    fn default_copy_options() -> BTreeMap<&'o str, &'o str> {
-        vec![("purge", "true")].into_iter().collect()
     }
 }
 

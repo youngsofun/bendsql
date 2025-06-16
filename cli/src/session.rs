@@ -624,11 +624,7 @@ impl Session {
         Ok(Some(ServerStats::default()))
     }
 
-    pub async fn stream_load_stdin(
-        &mut self,
-        query: &str,
-        options: BTreeMap<&str, &str>,
-    ) -> Result<()> {
+    pub async fn stream_load_stdin(&mut self, query: &str) -> Result<()> {
         let dir = std::env::temp_dir();
         // TODO:(everpcpc) write by chunks
         let mut lines = std::io::stdin().lock().lines();

@@ -179,12 +179,6 @@ struct Args {
     #[clap(short = 'd', long, help = "Data to load, @file or @- for stdin")]
     data: Option<String>,
 
-    #[clap(short = 'f', long, default_value = "csv", help = "Data format to load")]
-    format: InputFormat,
-
-    #[clap(long, value_parser = parse_key_val::<String, String>, help = "Data format options")]
-    format_opt: Vec<(String, String)>,
-
     #[clap(short = 'o', long, help = "Output format")]
     output: Option<OutputFormat>,
 
@@ -421,16 +415,15 @@ pub async fn main() -> Result<()> {
                 session.handle_reader(std::io::Cursor::new(query)).await?;
             }
             Some(data) => {
-                let options = args.format.get_options(&args.format_opt);
                 if data.starts_with('@') {
                     match data.strip_prefix('@') {
-                        Some("-") => session.stream_load_stdin(&query, options).await?,
+                        Some("-") => session.stream_load_stdin(&query).await?,
                         Some(fname) => {
                             let path = std::path::Path::new(fname);
                             if !path.exists() {
                                 return Err(anyhow!("file not found: {fname}"));
                             }
-                            session.stream_load_file(&query, path, options).await?
+                            session.stream_load_file(&query, path).await?
                         }
                         None => {
                             return Err(anyhow!("invalid data input: {data}"));

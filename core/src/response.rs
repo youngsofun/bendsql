@@ -88,6 +88,12 @@ pub struct QueryResponse {
     pub kill_uri: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LoadResponse {
+    pub id: String,
+    pub stats: ProgressValues,
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::BTreeMap;
