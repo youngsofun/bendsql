@@ -15,6 +15,7 @@
 use crate::error_code::ErrorCode;
 use crate::session::SessionState;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::wasm_bindgen;
 
 #[derive(Deserialize, Debug)]
 pub struct QueryStats {

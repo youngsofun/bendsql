@@ -46,6 +46,7 @@ fn default_session_token_ttl_in_secs() -> u64 {
 pub struct SessionTokenInfo {
     pub session_token: String,
     #[serde(default = "default_session_token_ttl_in_secs")]
+    #[allow(unused)]
     pub session_token_ttl_in_secs: u64,
     pub refresh_token: String,
 }

@@ -276,11 +276,11 @@ impl_tuple_from_row!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14
 
 pub struct RowIterator {
     schema: SchemaRef,
-    it: Pin<Box<dyn Stream<Item = Result<Row>> + Send>>,
+    it: Pin<Box<dyn Stream<Item = Result<Row>>>>,
 }
 
 impl RowIterator {
-    pub fn new(schema: SchemaRef, it: Pin<Box<dyn Stream<Item = Result<Row>> + Send>>) -> Self {
+    pub fn new(schema: SchemaRef, it: Pin<Box<dyn Stream<Item = Result<Row>>>>) -> Self {
         Self { schema, it }
     }
 
@@ -312,13 +312,13 @@ impl Stream for RowIterator {
 
 pub struct RowStatsIterator {
     schema: SchemaRef,
-    it: Pin<Box<dyn Stream<Item = Result<RowWithStats>> + Send>>,
+    it: Pin<Box<dyn Stream<Item = Result<RowWithStats>>>>,
 }
 
 impl RowStatsIterator {
     pub fn new(
         schema: SchemaRef,
-        it: Pin<Box<dyn Stream<Item = Result<RowWithStats>> + Send>>,
+        it: Pin<Box<dyn Stream<Item = Result<RowWithStats>>>>,
     ) -> Self {
         Self { schema, it }
     }

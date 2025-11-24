@@ -17,6 +17,8 @@ pub mod conn;
 #[cfg(feature = "flight-sql")]
 mod flight_sql;
 mod params;
+#[cfg(not(target_arch = "wasm32"))]
+
 mod placeholder;
 pub mod rest_api;
 

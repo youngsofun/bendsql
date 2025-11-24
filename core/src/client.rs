@@ -16,16 +16,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
+use async_trait::async_trait;
 use crate::auth::{AccessTokenAuth, AccessTokenFileAuth, Auth, BasicAuth};
 use crate::error_code::{need_refresh_token, ResponseWithErrorCode};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::global_cookie_store::GlobalCookieStore;
 use crate::login::{
     LoginRequest, LoginResponseResult, RefreshResponse, RefreshSessionTokenRequest,
     SessionTokenInfo,
 };
-use crate::presign::{presign_upload_to_stage, PresignMode, PresignedResponse, Reader};
-use crate::stage::StageLocation;
 use crate::{
     error::{Error, Result},
     request::{PaginationConfig, QueryRequest, StageAttachmentConfig},
@@ -35,21 +34,25 @@ use crate::{
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::cookie::CookieStore;
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::multipart::{Form, Part};
-use reqwest::{Body, Client as HttpClient, Request, RequestBuilder, Response, StatusCode};
+use reqwest::header::HeaderMap;
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::header::HeaderValue;
+use reqwest::{
+    Client as HttpClient, Error as HttpError, Request, RequestBuilder, Response, StatusCode,
+};
 use serde::Deserialize;
 use tokio::time::sleep;
-use tokio_retry::strategy::jitter;
-use tokio_util::io::ReaderStream;
 use url::Url;
 
 const HEADER_QUERY_ID: &str = "X-DATABEND-QUERY-ID";
 const HEADER_TENANT: &str = "X-DATABEND-TENANT";
 const HEADER_STICKY_NODE: &str = "X-DATABEND-STICKY-NODE";
 const HEADER_WAREHOUSE: &str = "X-DATABEND-WAREHOUSE";
-const HEADER_STAGE_NAME: &str = "X-DATABEND-STAGE-NAME";
+#[cfg(not(target_arch = "wasm32"))]
+
+pub(crate) const HEADER_STAGE_NAME: &str = "X-DATABEND-STAGE-NAME";
 const HEADER_ROUTE_HINT: &str = "X-DATABEND-ROUTE-HINT";
 const TXN_STATE_ACTIVE: &str = "Active";
 
@@ -58,14 +61,42 @@ static VERSION: Lazy<String> = Lazy::new(|| {
     version.to_string()
 });
 
+fn is_connect_error(err: &HttpError) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        err.is_connect()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        println!("{err}");
+        true
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+
+#[derive(Debug, Clone)]
+pub enum PresignMode {
+    Auto,
+    Detect,
+    On,
+    Off,
+}
+
+
+#[async_trait(?Send)]
+pub trait ClientIf {
+    async fn start_query(&self, sql: &str) -> Result<QueryResponse>;
+}
+
 #[derive(Clone)]
 pub struct APIClient {
-    cli: HttpClient,
+    pub(super) cli: HttpClient,
     scheme: String,
-    host: String,
+    pub(super) host: String,
     port: u16,
 
-    endpoint: Url,
+    pub(super) endpoint: Url,
 
     auth: Arc<dyn Auth>,
 
@@ -91,15 +122,31 @@ pub struct APIClient {
 
     tls_ca_file: Option<String>,
 
-    presign: PresignMode,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) presign: PresignMode,
     last_node_id: Arc<parking_lot::Mutex<Option<String>>>,
     last_query_id: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
+
+#[async_trait(?Send)]
+impl ClientIf for APIClient {
+    async fn start_query(&self, sql: &str) -> Result<QueryResponse> {
+        info!("start query: {}", sql);
+        self.start_query_inner(sql, None).await
+    }
+}
+
+
 impl APIClient {
+    // async fn start_query(&self, sql: &str) -> Result<QueryResponse> {
+    //     info!("start query: {}", sql);
+    //     self.start_query_inner(sql, None).await
+    // }
     pub async fn new(dsn: &str, name: Option<String>) -> Result<Self> {
         let mut client = Self::from_dsn(dsn).await?;
         client.build_client(name).await?;
+        #[cfg(not(target_arch = "wasm32"))]
         client.check_presign().await?;
         if !client.disable_login {
             client.login().await?;
@@ -144,6 +191,7 @@ impl APIClient {
                         Duration::from_secs(secs)
                     };
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 "presign" => {
                     client.presign = match v.as_ref() {
                         "auto" => PresignMode::Auto,
@@ -251,43 +299,31 @@ impl APIClient {
             Some(n) => n,
             None => format!("databend-client-rust/{}", VERSION.as_str()),
         };
-        let cookie_provider = GlobalCookieStore::new();
-        let cookie = HeaderValue::from_str("cookie_enabled=true").unwrap();
-        let mut initial_cookies = [&cookie].into_iter();
-        cookie_provider.set_cookies(&mut initial_cookies, &Url::parse("https://a.com").unwrap());
-        let mut cli_builder = HttpClient::builder()
-            .user_agent(ua)
-            .cookie_provider(Arc::new(cookie_provider))
-            .pool_idle_timeout(Duration::from_secs(1));
-        #[cfg(any(feature = "rustls", feature = "native-tls"))]
-        if self.scheme == "https" {
-            if let Some(ref ca_file) = self.tls_ca_file {
-                let cert_pem = tokio::fs::read(ca_file).await?;
-                let cert = reqwest::Certificate::from_pem(&cert_pem)?;
-                cli_builder = cli_builder.add_root_certificate(cert);
-            }
-        }
-        self.cli = cli_builder.build()?;
-        Ok(())
-    }
 
-    async fn check_presign(&mut self) -> Result<()> {
-        match self.presign {
-            PresignMode::Auto => {
-                if self.host.ends_with(".databend.com") || self.host.ends_with(".databend.cn") {
-                    self.presign = PresignMode::On;
-                } else {
-                    self.presign = PresignMode::Off;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.cli = HttpClient::builder().user_agent(ua).build()?;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cookie_provider = GlobalCookieStore::new();
+            let cookie = HeaderValue::from_str("cookie_enabled=true").unwrap();
+            let mut initial_cookies = [&cookie].into_iter();
+            cookie_provider
+                .set_cookies(&mut initial_cookies, &Url::parse("https://a.com").unwrap());
+            let mut cli_builder = HttpClient::builder()
+                .user_agent(ua)
+                .cookie_provider(Arc::new(cookie_provider));
+            cli_builder = cli_builder.pool_idle_timeout(Duration::from_secs(1));
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            if self.scheme == "https" {
+                if let Some(ref ca_file) = self.tls_ca_file {
+                    let cert_pem = tokio::fs::read(ca_file).await?;
+                    let cert = reqwest::Certificate::from_pem(&cert_pem)?;
+                    cli_builder = cli_builder.add_root_certificate(cert);
                 }
             }
-            PresignMode::Detect => match self.get_presigned_upload_url("@~/.bendsql/check").await {
-                Ok(_) => self.presign = PresignMode::On,
-                Err(e) => {
-                    warn!("presign mode off with error detected: {}", e);
-                    self.presign = PresignMode::Off;
-                }
-            },
-            _ => {}
+            self.cli = cli_builder.build()?;
         }
         Ok(())
     }
@@ -307,7 +343,7 @@ impl APIClient {
         guard.database.clone()
     }
 
-    pub async fn current_role(&self) -> Option<String> {
+    pub fn current_role(&self) -> Option<String> {
         let guard = self.session_state.lock();
         guard.role.clone()
     }
@@ -325,7 +361,7 @@ impl APIClient {
         self.auth.username()
     }
 
-    fn gen_query_id(&self) -> String {
+    pub(super) fn gen_query_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
@@ -374,12 +410,9 @@ impl APIClient {
         }
     }
 
-    pub async fn start_query(&self, sql: &str) -> Result<QueryResponse> {
-        info!("start query: {}", sql);
-        self.start_query_inner(sql, None).await
-    }
 
-    fn wrap_auth_or_session_token(&self, builder: RequestBuilder) -> Result<RequestBuilder> {
+
+    pub(super) fn wrap_auth_or_session_token(&self, builder: RequestBuilder) -> Result<RequestBuilder> {
         if let Some(info) = &self.session_token_info {
             let info = info.lock();
             Ok(builder.bearer_auth(info.0.session_token.clone()))
@@ -388,7 +421,7 @@ impl APIClient {
         }
     }
 
-    async fn start_query_inner(
+    pub(super) async fn start_query_inner(
         &self,
         sql: &str,
         stage_attachment_config: Option<StageAttachmentConfig<'_>>,
@@ -485,7 +518,7 @@ impl APIClient {
         Ok(())
     }
 
-    async fn wait_for_query(&self, resp: QueryResponse) -> Result<QueryResponse> {
+    pub(super) async fn wait_for_query(&self, resp: QueryResponse) -> Result<QueryResponse> {
         info!("wait for query: {}", resp.id);
         let node_id = resp.node_id.clone();
         if let Some(node_id) = self.last_node_id() {
@@ -541,7 +574,7 @@ impl APIClient {
         Some(pagination)
     }
 
-    fn make_headers(&self, query_id: Option<&str>) -> Result<HeaderMap> {
+    pub(super) fn make_headers(&self, query_id: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         if let Some(tenant) = &self.tenant {
             headers.insert(HEADER_TENANT, tenant.parse()?);
@@ -556,106 +589,6 @@ impl APIClient {
             headers.insert(HEADER_QUERY_ID, query_id.parse()?);
         }
         Ok(headers)
-    }
-
-    pub async fn insert_with_stage(
-        &self,
-        sql: &str,
-        stage: &str,
-        file_format_options: BTreeMap<&str, &str>,
-        copy_options: BTreeMap<&str, &str>,
-    ) -> Result<QueryResponse> {
-        info!(
-            "insert with stage: {}, format: {:?}, copy: {:?}",
-            sql, file_format_options, copy_options
-        );
-        let stage_attachment = Some(StageAttachmentConfig {
-            location: stage,
-            file_format_options: Some(file_format_options),
-            copy_options: Some(copy_options),
-        });
-        let resp = self.start_query_inner(sql, stage_attachment).await?;
-        let resp = self.wait_for_query(resp).await?;
-        Ok(resp)
-    }
-
-    async fn get_presigned_upload_url(&self, stage: &str) -> Result<PresignedResponse> {
-        info!("get presigned upload url: {}", stage);
-        let sql = format!("PRESIGN UPLOAD {}", stage);
-        let resp = self.query(&sql).await?;
-        if resp.data.len() != 1 {
-            return Err(Error::Decode(
-                "Empty response from server for presigned request".to_string(),
-            ));
-        }
-        if resp.data[0].len() != 3 {
-            return Err(Error::Decode(
-                "Invalid response from server for presigned request".to_string(),
-            ));
-        }
-        // resp.data[0]: [ "PUT", "{\"host\":\"s3.us-east-2.amazonaws.com\"}", "https://s3.us-east-2.amazonaws.com/query-storage-xxxxx/tnxxxxx/stage/user/xxxx/xxx?" ]
-        let method = resp.data[0][0].clone().unwrap_or_default();
-        if method != "PUT" {
-            return Err(Error::Decode(format!(
-                "Invalid method for presigned upload request: {}",
-                method
-            )));
-        }
-        let headers: BTreeMap<String, String> =
-            serde_json::from_str(resp.data[0][1].clone().unwrap_or("{}".to_string()).as_str())?;
-        let url = resp.data[0][2].clone().unwrap_or_default();
-        Ok(PresignedResponse {
-            method,
-            headers,
-            url,
-        })
-    }
-
-    pub async fn upload_to_stage(&self, stage: &str, data: Reader, size: u64) -> Result<()> {
-        match self.presign {
-            PresignMode::Off => self.upload_to_stage_with_stream(stage, data, size).await,
-            PresignMode::On => {
-                let presigned = self.get_presigned_upload_url(stage).await?;
-                presign_upload_to_stage(presigned, data, size).await
-            }
-            PresignMode::Auto => {
-                unreachable!("PresignMode::Auto should be handled during client initialization")
-            }
-            PresignMode::Detect => {
-                unreachable!("PresignMode::Detect should be handled during client initialization")
-            }
-        }
-    }
-
-    /// Upload data to stage with stream api, should not be used directly, use `upload_to_stage` instead.
-    async fn upload_to_stage_with_stream(
-        &self,
-        stage: &str,
-        data: Reader,
-        size: u64,
-    ) -> Result<()> {
-        info!("upload to stage with stream: {}, size: {}", stage, size);
-        if let Some(info) = self.need_pre_refresh_session().await {
-            self.refresh_session_token(info).await?;
-        }
-        let endpoint = self.endpoint.join("v1/upload_to_stage")?;
-        let location = StageLocation::try_from(stage)?;
-        let query_id = self.gen_query_id();
-        let mut headers = self.make_headers(Some(&query_id))?;
-        headers.insert(HEADER_STAGE_NAME, location.name.parse()?);
-        let stream = Body::wrap_stream(ReaderStream::new(data));
-        let part = Part::stream_with_length(stream, size).file_name(location.path);
-        let form = Form::new().part("upload", part);
-        let mut builder = self.cli.put(endpoint.clone());
-        builder = self.wrap_auth_or_session_token(builder)?;
-        let resp = builder.headers(headers).multipart(form).send().await?;
-        let status = resp.status();
-        if status != 200 {
-            return Err(
-                Error::response_error(status, &resp.bytes().await?).with_context("upload_to_stage")
-            );
-        }
-        Ok(())
     }
 
     async fn login(&mut self) -> Result<()> {
@@ -724,7 +657,7 @@ impl APIClient {
                 .is_ok()
     }
 
-    async fn refresh_session_token(
+    pub(super) async fn refresh_session_token(
         &self,
         self_login_info: Arc<parking_lot::Mutex<(SessionTokenInfo, Instant)>>,
     ) -> Result<()> {
@@ -765,17 +698,18 @@ impl APIClient {
                     }
                 }
                 Err(err) => {
-                    if !(err.is_timeout() || err.is_connect()) || i > 2 {
+                    if !(err.is_timeout() || is_connect_error(&err)) || i > 2 {
                         return Err(Error::Request(err.to_string()));
                     }
                 }
             };
-            sleep(jitter(Duration::from_secs(10))).await;
+            sleep(Duration::from_secs(10).mul_f64(rand::random::<f64>() + 0.5)).await;
         }
         Ok(())
     }
 
-    async fn need_pre_refresh_session(
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) async fn need_pre_refresh_session(
         &self,
     ) -> Option<Arc<parking_lot::Mutex<(SessionTokenInfo, Instant)>>> {
         if let Some(info) = &self.session_token_info {
@@ -874,7 +808,7 @@ impl APIClient {
                 }
                 Err(err) => (
                     Error::Request(err.to_string()),
-                    err.is_timeout() || err.is_connect(),
+                    err.is_timeout() || is_connect_error(&err),
                 ),
             };
             if !retry {
@@ -908,7 +842,7 @@ impl APIClient {
                     );
                 }
             }
-            sleep(jitter(Duration::from_secs(10))).await;
+            sleep(Duration::from_secs(10).mul_f64(rand::random::<f64>() + 0.5)).await;
         }
     }
 
@@ -966,6 +900,7 @@ impl Default for APIClient {
             connect_timeout: Duration::from_secs(10),
             page_request_timeout: Duration::from_secs(30),
             tls_ca_file: None,
+            #[cfg(not(target_arch = "wasm32"))]
             presign: PresignMode::Auto,
             route_hint: Arc::new(RouteHintGenerator::new()),
             last_node_id: Arc::new(Default::default()),

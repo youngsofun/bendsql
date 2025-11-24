@@ -116,13 +116,13 @@ impl IntoIterator for RawRows {
 
 pub struct RawRowIterator {
     schema: SchemaRef,
-    it: Pin<Box<dyn Stream<Item = Result<RawRow>> + Send>>,
+    it: Pin<Box<dyn Stream<Item = Result<RawRow>>>>,
 }
 
 impl RawRowIterator {
     pub fn new(
         schema: SchemaRef,
-        it: Pin<Box<dyn Stream<Item = Result<RawRowWithStats>> + Send>>,
+        it: Pin<Box<dyn Stream<Item = Result<RawRowWithStats>>>>,
     ) -> Self {
         let it = it.filter_map(|r| match r {
             Ok(RawRowWithStats::Row(r)) => Some(Ok(r)),

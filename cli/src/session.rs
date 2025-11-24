@@ -502,7 +502,7 @@ impl Session {
         queries
     }
 
-    #[async_recursion]
+    #[async_recursion(?Send)]
     pub async fn handle_query(
         &mut self,
         is_repl: bool,
@@ -562,7 +562,7 @@ impl Session {
         }
     }
 
-    #[async_recursion]
+    //#[async_recursion]
     pub async fn handle_commands(&mut self, query: &str) -> Result<Option<ServerStats>> {
         match query {
             "!exit" | "!quit" => {

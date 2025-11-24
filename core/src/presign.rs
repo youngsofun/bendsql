@@ -14,24 +14,20 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use log::info;
+use crate::client::client::PresignMode;
+use crate::client::client::HEADER_STAGE_NAME;
+use crate::error::{Error, Result};
+use crate::request::StageAttachmentConfig;
+pub use crate::{APIClient, QueryResponse, StageLocation};
+use log::{info, warn};
+use reqwest::multipart::{Form, Part};
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
-use crate::error::{Error, Result};
-
 pub type Reader = Box<dyn AsyncRead + Send + Sync + Unpin + 'static>;
-
-#[derive(Debug, Clone)]
-pub enum PresignMode {
-    Auto,
-    Detect,
-    On,
-    Off,
-}
 
 pub struct PresignedResponse {
     pub method: String,
@@ -97,5 +93,133 @@ pub async fn presign_download_from_stage(
             "Download with presigned url failed: {}",
             status
         ))),
+    }
+}
+
+impl APIClient {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) async fn check_presign(&mut self) -> Result<()> {
+        match self.presign {
+            PresignMode::Auto => {
+                if self.host.ends_with(".databend.com") || self.host.ends_with(".databend.cn") {
+                    self.presign = PresignMode::On;
+                } else {
+                    self.presign = PresignMode::Off;
+                }
+            }
+            PresignMode::Detect => match self.get_presigned_upload_url("@~/.bendsql/check").await {
+                Ok(_) => self.presign = PresignMode::On,
+                Err(e) => {
+                    warn!("presign mode off with error detected: {}", e);
+                    self.presign = PresignMode::Off;
+                }
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn insert_with_stage(
+        &self,
+        sql: &str,
+        stage: &str,
+        file_format_options: BTreeMap<&str, &str>,
+        copy_options: BTreeMap<&str, &str>,
+    ) -> Result<QueryResponse> {
+        info!(
+            "insert with stage: {}, format: {:?}, copy: {:?}",
+            sql, file_format_options, copy_options
+        );
+        let stage_attachment = Some(StageAttachmentConfig {
+            location: stage,
+            file_format_options: Some(file_format_options),
+            copy_options: Some(copy_options),
+        });
+        let resp = self.start_query_inner(sql, stage_attachment).await?;
+        let resp = self.wait_for_query(resp).await?;
+        Ok(resp)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+
+    async fn get_presigned_upload_url(&self, stage: &str) -> Result<PresignedResponse> {
+        info!("get presigned upload url: {}", stage);
+        let sql = format!("PRESIGN UPLOAD {}", stage);
+        let resp = self.query(&sql).await?;
+        if resp.data.len() != 1 {
+            return Err(Error::Decode(
+                "Empty response from server for presigned request".to_string(),
+            ));
+        }
+        if resp.data[0].len() != 3 {
+            return Err(Error::Decode(
+                "Invalid response from server for presigned request".to_string(),
+            ));
+        }
+        // resp.data[0]: [ "PUT", "{\"host\":\"s3.us-east-2.amazonaws.com\"}", "https://s3.us-east-2.amazonaws.com/query-storage-xxxxx/tnxxxxx/stage/user/xxxx/xxx?" ]
+        let method = resp.data[0][0].clone().unwrap_or_default();
+        if method != "PUT" {
+            return Err(Error::Decode(format!(
+                "Invalid method for presigned upload request: {}",
+                method
+            )));
+        }
+        let headers: BTreeMap<String, String> =
+            serde_json::from_str(resp.data[0][1].clone().unwrap_or("{}".to_string()).as_str())?;
+        let url = resp.data[0][2].clone().unwrap_or_default();
+        Ok(PresignedResponse {
+            method,
+            headers,
+            url,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn upload_to_stage(&self, stage: &str, data: Reader, size: u64) -> Result<()> {
+        match self.presign {
+            PresignMode::Off => self.upload_to_stage_with_stream(stage, data, size).await,
+            PresignMode::On => {
+                let presigned = self.get_presigned_upload_url(stage).await?;
+                presign_upload_to_stage(presigned, data, size).await
+            }
+            PresignMode::Auto => {
+                unreachable!("PresignMode::Auto should be handled during client initialization")
+            }
+            PresignMode::Detect => {
+                unreachable!("PresignMode::Detect should be handled during client initialization")
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Upload data to stage with stream api, should not be used directly, use `upload_to_stage` instead.
+    async fn upload_to_stage_with_stream(
+        &self,
+        stage: &str,
+        data: Reader,
+        size: u64,
+    ) -> Result<()> {
+        info!("upload to stage with stream: {}, size: {}", stage, size);
+        if let Some(info) = self.need_pre_refresh_session().await {
+            self.refresh_session_token(info).await?;
+        }
+        let endpoint = self.endpoint.join("v1/upload_to_stage")?;
+        let location = StageLocation::try_from(stage)?;
+        let query_id = self.gen_query_id();
+        let mut headers = self.make_headers(Some(&query_id))?;
+        headers.insert(HEADER_STAGE_NAME, location.name.parse()?);
+        let stream = Body::wrap_stream(ReaderStream::new(data));
+        let part = Part::stream_with_length(stream, size).file_name(location.path);
+        let form = Form::new().part("upload", part);
+        let mut builder = self.cli.put(endpoint.clone());
+        builder = self.wrap_auth_or_session_token(builder)?;
+        let resp = builder.headers(headers).multipart(form).send().await?;
+        let status = resp.status();
+        if status != 200 {
+            return Err(
+                Error::response_error(status, &resp.bytes().await?).with_context("upload_to_stage")
+            );
+        }
+        Ok(())
     }
 }

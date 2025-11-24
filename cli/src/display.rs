@@ -38,7 +38,7 @@ use crate::{
 pub(crate) const INTERRUPTED_MESSAGE: &str = "Interrupted by Ctrl+C";
 const HEAD_YELLOW: Color = Color::DarkBlue;
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait ChunkDisplay {
     async fn display(&mut self, expand: Option<ExpandMode>) -> Result<ServerStats>;
 }
@@ -410,7 +410,7 @@ impl FormatDisplay<'_> {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl ChunkDisplay for FormatDisplay<'_> {
     async fn display(&mut self, expand: Option<ExpandMode>) -> Result<ServerStats> {
         if self.interrupted.load(Ordering::SeqCst) {

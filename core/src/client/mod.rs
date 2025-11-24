@@ -11,33 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
- mod client;
-
-mod auth;
-mod error;
-mod error_code;
+mod client;
 #[cfg(not(target_arch = "wasm32"))]
-mod global_cookie_store;
-mod login;
+pub(crate) mod presign;
+#[cfg(target_arch = "wasm32")]
+//#[cfg(not(target_arch = "wasm32"))]
 
-mod request;
-mod response;
+mod wasm_client;
 
-mod session;
-mod stage;
 
-pub use auth::SensitiveString;
-#[cfg(not(target_arch = "wasm32"))]
-pub use client::presign::presign_download_from_stage;
-#[cfg(not(target_arch = "wasm32"))]
-pub use client::presign::presign_upload_to_stage;
-#[cfg(not(target_arch = "wasm32"))]
-pub use client::presign::PresignedResponse;
 pub use client::APIClient;
 pub use client::ClientIf;
-pub use error::Error;
-pub use response::QueryResponse;
-pub use response::QueryStats;
-pub use response::SchemaField;
-pub use stage::StageLocation;

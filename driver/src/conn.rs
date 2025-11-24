@@ -17,12 +17,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::io::BufReader;
 use tokio_stream::StreamExt;
 
 use databend_client::StageLocation;
+#[cfg(not(target_arch = "wasm32"))]
 use databend_client::{presign_download_from_stage, PresignedResponse};
 use databend_driver_core::error::{Error, Result};
 use databend_driver_core::raw_rows::{RawRow, RawRowIterator};
@@ -42,7 +44,8 @@ pub struct ConnectionInfo {
 
 pub type Reader = Box<dyn AsyncRead + Send + Sync + Unpin + 'static>;
 
-#[async_trait]
+
+#[async_trait(?Send)]
 pub trait IConnection: Send + Sync {
     async fn info(&self) -> ConnectionInfo;
     async fn close(&self) -> Result<()> {
@@ -92,12 +95,16 @@ pub trait IConnection: Send + Sync {
         rows.collect().await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+
     /// Get presigned url for a given operation and stage location.
     /// The operation can be "UPLOAD" or "DOWNLOAD".
     async fn get_presigned_url(&self, operation: &str, stage: &str) -> Result<PresignedResponse>;
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn upload_to_stage(&self, stage: &str, data: Reader, size: u64) -> Result<()>;
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn load_data(
         &self,
         sql: &str,
@@ -107,6 +114,7 @@ pub trait IConnection: Send + Sync {
         copy_options: Option<BTreeMap<&str, &str>>,
     ) -> Result<ServerStats>;
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn load_file(
         &self,
         sql: &str,
@@ -115,8 +123,10 @@ pub trait IConnection: Send + Sync {
         copy_options: Option<BTreeMap<&str, &str>>,
     ) -> Result<ServerStats>;
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn stream_load(&self, sql: &str, data: Vec<Vec<&str>>) -> Result<ServerStats>;
 
+    #[cfg(not(target_arch = "wasm32"))]
     // PUT file://<path_to_file>/<filename> internalStage|externalStage
     async fn put_files(&self, local_file: &str, stage: &str) -> Result<RowStatsIterator> {
         let mut total_count: usize = 0;
@@ -172,6 +182,7 @@ pub trait IConnection: Send + Sync {
         ))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn get_files(&self, stage: &str, local_file: &str) -> Result<RowStatsIterator> {
         let mut total_count: usize = 0;
         let mut total_size: usize = 0;

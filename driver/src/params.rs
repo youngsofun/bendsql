@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+#[cfg(not(target_arch = "wasm32"))]
 use databend_common_ast::parser::Dialect;
 
 pub trait Param: Debug {
@@ -78,7 +79,9 @@ impl Params {
     }
 
     pub fn replace(&self, sql: &str) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
         if !self.is_empty() {
+
             let tokens = databend_common_ast::parser::tokenize_sql(sql).unwrap();
             if let Ok((stmt, _)) =
                 databend_common_ast::parser::parse_sql(&tokens, Dialect::PostgreSQL)

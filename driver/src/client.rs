@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use once_cell::sync::Lazy;
@@ -24,6 +26,7 @@ use crate::flight_sql::FlightSQLConnection;
 use crate::ConnectionInfo;
 use crate::Params;
 
+#[cfg(not(target_arch = "wasm32"))]
 use databend_client::PresignedResponse;
 use databend_driver_core::error::{Error, Result};
 use databend_driver_core::raw_rows::{RawRow, RawRowIterator};
@@ -161,6 +164,7 @@ impl Connection {
     pub async fn query_raw_all(&self, sql: &str) -> Result<Vec<RawRow>> {
         self.inner.query_raw_all(sql).await
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     /// Get presigned url for a given operation and stage location.
     /// The operation can be "UPLOAD" or "DOWNLOAD".
@@ -171,10 +175,13 @@ impl Connection {
     ) -> Result<PresignedResponse> {
         self.inner.get_presigned_url(operation, stage).await
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     pub async fn upload_to_stage(&self, stage: &str, data: Reader, size: u64) -> Result<()> {
         self.inner.upload_to_stage(stage, data, size).await
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     pub async fn load_data(
         &self,
@@ -188,6 +195,7 @@ impl Connection {
             .load_data(sql, data, size, file_format_options, copy_options)
             .await
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     pub async fn load_file(
         &self,
@@ -200,15 +208,19 @@ impl Connection {
             .load_file(sql, fp, format_options, copy_options)
             .await
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     pub async fn stream_load(&self, sql: &str, data: Vec<Vec<&str>>) -> Result<ServerStats> {
         self.inner.stream_load(sql, data).await
     }
-
+    #[cfg(not(target_arch = "wasm32"))]
     // PUT file://<path_to_file>/<filename> internalStage|externalStage
     pub async fn put_files(&self, local_file: &str, stage: &str) -> Result<RowStatsIterator> {
         self.inner.put_files(local_file, stage).await
     }
+    #[cfg(not(target_arch = "wasm32"))]
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     pub async fn get_files(&self, stage: &str, local_file: &str) -> Result<RowStatsIterator> {
         self.inner.get_files(stage, local_file).await

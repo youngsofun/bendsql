@@ -45,7 +45,7 @@ impl FromNapiValue for ValueOptions {
             opts.variant_as_object = val;
         }
         Ok(opts)
-    }
+}
 }
 
 #[napi]
@@ -101,7 +101,7 @@ impl Connection {
     #[napi]
     pub async fn version(&self) -> Result<String> {
         self.inner.version().await.map_err(format_napi_error)
-    }
+}
 
     #[napi]
     pub fn format_sql(&self, sql: String, params: Option<Params>) -> Result<String> {

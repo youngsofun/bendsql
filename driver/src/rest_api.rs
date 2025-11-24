@@ -22,17 +22,20 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use log::info;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::fs::File;
 use tokio::io::BufReader;
 use tokio_stream::Stream;
 
+#[cfg(not(target_arch = "wasm32"))]
 use databend_client::PresignedResponse;
 use databend_client::QueryResponse;
-use databend_client::{APIClient, SchemaField};
+use databend_client::{APIClient, ClientIf, SchemaField};
 use databend_driver_core::error::{Error, Result};
 use databend_driver_core::raw_rows::{RawRow, RawRowIterator, RawRowWithStats};
 use databend_driver_core::rows::{Row, RowIterator, RowStatsIterator, RowWithStats, ServerStats};
 use databend_driver_core::schema::{Schema, SchemaRef};
+
 
 use crate::conn::{ConnectionInfo, IConnection, Reader};
 
@@ -41,7 +44,7 @@ pub struct RestAPIConnection {
     client: Arc<APIClient>,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl IConnection for RestAPIConnection {
     async fn info(&self) -> ConnectionInfo {
         ConnectionInfo {
@@ -108,6 +111,7 @@ impl IConnection for RestAPIConnection {
             RestAPIRows::<RawRowWithStats>::from_response(self.client.clone(), resp)?;
         Ok(RawRowIterator::new(Arc::new(schema), Box::pin(rows)))
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     async fn get_presigned_url(&self, operation: &str, stage: &str) -> Result<PresignedResponse> {
         info!("get presigned url: {} {}", operation, stage);
@@ -124,11 +128,13 @@ impl IConnection for RestAPIConnection {
             url,
         })
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     async fn upload_to_stage(&self, stage: &str, data: Reader, size: u64) -> Result<()> {
         self.client.upload_to_stage(stage, data, size).await?;
         Ok(())
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     async fn load_data(
         &self,
@@ -158,6 +164,7 @@ impl IConnection for RestAPIConnection {
             .await?;
         Ok(ServerStats::from(resp.stats))
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     async fn load_file(
         &self,
@@ -192,6 +199,7 @@ impl IConnection for RestAPIConnection {
         )
         .await
     }
+    #[cfg(not(target_arch = "wasm32"))]
 
     async fn stream_load(&self, sql: &str, data: Vec<Vec<&str>>) -> Result<ServerStats> {
         info!("stream load: {}, length: {:?}", sql, data.len());
@@ -271,7 +279,7 @@ impl<'o> RestAPIConnection {
     }
 }
 
-type PageFut = Pin<Box<dyn Future<Output = Result<QueryResponse>> + Send>>;
+type PageFut = Pin<Box<dyn Future<Output = Result<QueryResponse>>>>;
 
 pub struct RestAPIRows<T> {
     client: Arc<APIClient>,
