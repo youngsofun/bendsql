@@ -1,0 +1,94 @@
+name: sccache startup diagnostics
+
+on:
+  push:
+    branches: [ci/sccache-startup-diagnostics]
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    if: github.repository == 'youngsofun/bendsql'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+        with:
+          version: v0.20.0
+          disable_annotations: true
+
+      - name: Compare GitHub and local cache startup
+        shell: bash
+        run: |
+          umask 077
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          sccache --version
+
+          probe() (
+            label=$1
+            export SCCACHE_GHA_ENABLED=$2 SCCACHE_SERVER_PORT=$3
+            export SCCACHE_CONF="$scratch/$label.toml"
+            export SCCACHE_DIR="$scratch/$label-cache"
+            export SCCACHE_ERROR_LOG="$scratch/$label-daemon.log"
+            export SCCACHE_LOG='sccache::server=debug,sccache::cache=debug,opendal::services=debug,opendal::layers::retry=warn'
+            printf 'server_startup_timeout_ms = %s\n' "$4" > "$SCCACHE_CONF"
+
+            local SECONDS=0
+            rc=0
+            timeout 40s sccache --start-server > "$scratch/$label-client.log" 2>&1 || rc=$?
+            printf '%s: exit=%s elapsed=%ss limit=%sms\n' "$label" "$rc" "$SECONDS" "$4"
+            timeout 3s sccache --stop-server > /dev/null 2>&1 || true
+
+            # Print only allowlisted events and numeric HTTP statuses. Never print
+            # or upload raw logs: errors can contain headers or signed URLs.
+            python3 - "$scratch/$label-client.log" "$SCCACHE_ERROR_LOG" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          for name in sys.argv[1:]:
+              path = Path(name)
+              if not path.exists():
+                  continue
+              for line in path.read_text(errors="replace").splitlines():
+                  lower = line.lower()
+                  facts = []
+                  for needle, event in (
+                      ("start_server:", "daemon entered startup"),
+                      ("init gha cache", "initializing GitHub Actions Cache"),
+                      ("storage init failed", "cache initialization failed"),
+                      ("storage check failed", "cache capability check failed"),
+                      ("server started, listening", "daemon ready"),
+                      ("timed out waiting for server startup", "startup deadline reached"),
+                      ("will retry", "retrying cache operation"),
+                      ("dns error", "DNS failure"),
+                      ("certificate", "certificate error mentioned"),
+                      ("connection refused", "connection refused"),
+                  ):
+                      if needle in lower:
+                          facts.append(event)
+                  if "opendal::services" in lower or "opendal::layers::retry" in lower:
+                      operation = re.search(r"\b(read|write|delete|stat|readerread|writerwrite|writerclose)\b", lower)
+                      state = re.search(r"\b(started|succeeded|finished|failed|errored)\b", lower)
+                      if operation:
+                          facts.append(f"operation={operation[1]}")
+                      if state:
+                          facts.append(f"phase={state[1]}")
+                  api = re.search(r"\b(GetCacheEntryDownloadURL|CreateCacheEntry|FinalizeCacheEntryUpload)\b", line)
+                  status = re.search(r'(?i)\b(?:status(?:_code| code)?|http(?:/\d(?:\.\d)?)?)\s*[=:]?\s*["\x27]?(\d{3})\b', line)
+                  if api:
+                      facts.append(f"api={api[1]}")
+                  if status and 100 <= int(status[1]) <= 599:
+                      facts.append(f"http_status={status[1]}")
+                  if facts:
+                      print("  " + ", ".join(facts))
+          PY
+            return "$rc"
+          )
+
+          if ! probe github-10s true 4226 10000; then
+            probe github-30s true 4227 30000 || true
+          fi
+          probe local-10s false 4228 10000
